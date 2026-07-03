@@ -1,0 +1,6 @@
+﻿  main.c
+D:\202607代码\sniffer\sniffer\main.c(2,9): warning C4005: “_CRT_SECURE_NO_WARNINGS”: 宏重定义
+      D:\202607代码\sniffer\sniffer\main.c(2,9):
+      之前在命令行上声明的“_CRT_SECURE_NO_WARNINGS”
+  
+  sniffer.vcxproj -> D:\202607代码\sniffer\x64\Debug\sniffer.exe
