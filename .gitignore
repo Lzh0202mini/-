@@ -1,0 +1,28 @@
+# VS缓存与配置
+.vs/
+*.suo
+*.user
+*.vc.db
+ipch/
+FileContentIndex/
+
+# 编译输出目录
+x64/
+Debug/
+Release/
+*.obj
+*.ilk
+*.pdb
+*.exe
+*.log
+*.tlog
+*.recipe
+*.lastbuildstate
+*.FileListAbsolute.txt
+
+# 抓包生成临时pcap
+*.pcap
+
+# 系统文件
+.DS_Store
+Thumbs.db
