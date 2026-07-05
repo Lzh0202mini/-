@@ -10,7 +10,7 @@
 #pragma comment(lib, "Packet.lib")
 #pragma comment(lib, "ws2_32.lib")
 
-// ===================== 全局流量统计结构体 =====================
+// ===================== 全局增强流量统计结构体 =====================
 typedef struct {
     unsigned long long total_pkts;    // 总捕获数据包数量
     unsigned long long total_bytes;   // 总字节
@@ -71,7 +71,7 @@ typedef struct udp_header
     u_short uh_sum;
 } udp_header;
 
-// ICMP头部（新增）
+// ICMP头部
 typedef struct icmp_header
 {
     u_char icmp_type;   // ICMP类型
@@ -93,7 +93,7 @@ void print_mac(u_char* mac)
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-// 打印ICMP类型说明（新增）
+// 打印ICMP类型说明
 void print_icmp_type(u_char type, u_char code)
 {
     switch (type)
@@ -116,17 +116,28 @@ void print_icmp_type(u_char type, u_char code)
     }
 }
 
-// 每秒打印一次流量统计面板
+// ===================== 增强版流量统计打印函数（核心完善功能） =====================
 void print_traffic_stat()
 {
     time_t now = time(NULL);
+    // 控制1秒打印一次，防止刷屏
     if (now - g_stat.last_print_time < 1)
         return;
     g_stat.last_print_time = now;
-    printf("\n==================== 流量统计面板 ====================\n");
-    printf("总捕获数据包：%llu | 总流量字节：%llu\n", g_stat.total_pkts, g_stat.total_bytes);
-    printf("TCP报文：%llu | UDP报文：%llu | ICMP报文：%llu\n", g_stat.tcp_cnt, g_stat.udp_cnt, g_stat.icmp_cnt);
-    printf("======================================================\n\n");
+
+    // 字节转MB，方便直观查看流量大小
+    double total_mb = (double)g_stat.total_bytes / 1024 / 1024;
+    unsigned long long other_pkt = g_stat.total_pkts - g_stat.tcp_cnt - g_stat.udp_cnt - g_stat.icmp_cnt;
+
+    printf("\n==================== 实时流量统计面板 ====================\n");
+    printf("总捕获数据包：%llu 个\n", g_stat.total_pkts);
+    printf("总捕获流量：%llu 字节 (%.2f MB)\n", g_stat.total_bytes, total_mb);
+    printf("----------------------------------------------------------\n");
+    printf("TCP报文数量：%llu 个\n", g_stat.tcp_cnt);
+    printf("UDP报文数量：%llu 个\n", g_stat.udp_cnt);
+    printf("ICMP报文数量：%llu 个\n", g_stat.icmp_cnt);
+    printf("其他IP报文：%llu 个\n", other_pkt);
+    printf("==========================================================\n\n");
 }
 
 // ===================== 数据包回调函数 =====================
@@ -137,7 +148,7 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     {
         pcap_dump((u_char*)g_dump, hdr, pkt);
     }
-    // 2. 更新全局流量统计
+    // 2. 更新全局流量统计总计数
     g_stat.total_pkts++;
     g_stat.total_bytes += hdr->len;
     printf("===== 捕获数据包 总长度:%d =====\n", hdr->len);
@@ -228,7 +239,7 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     }
     else if (proto_flag == 1)
     {
-        // ICMP解析（新增完整逻辑）
+        // ICMP解析
         struct icmp_header* icmp = (struct icmp_header*)trans_pkt;
         printf("【ICMP头部】类型：");
         print_icmp_type(icmp->icmp_type, icmp->icmp_code);
@@ -243,6 +254,7 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     }
 
     printf("\n");
+    // 每次解析完一条报文自动调用流量统计函数
     print_traffic_stat();
 }
 
@@ -254,9 +266,10 @@ int main()
     int i = 0, sel;
     struct bpf_program fp;
     const char* filter_rule = "ip and (tcp or udp or icmp)";
-    printf("==== C语言数据包捕获解析工具（课程项目07）====\n");
-    printf("功能：抓包解析 + 实时流量统计 + PCAP自动保存 capture.pcap\n");
+    printf("==== C语言数据包捕获解析工具（完善流量统计版）====\n");
+    printf("功能：抓包解析 + 增强实时流量统计 + PCAP自动保存 capture.pcap\n");
     printf("支持：以太网、IPv4、TCP、UDP、ICMP完整解析\n");
+    printf("流量统计：总报文、总流量MB、各协议报文计数\n");
     printf("停止方式：Ctrl + C\n\n");
 
     // 1. 枚举网卡
