@@ -3,4 +3,6 @@ D:\202607代码\sniffer\sniffer\main.c(2,9): warning C4005: “_CRT_SECURE_NO_WA
       D:\202607代码\sniffer\sniffer\main.c(2,9):
       之前在命令行上声明的“_CRT_SECURE_NO_WARNINGS”
   
+D:\202607代码\sniffer\sniffer\main.c(350,31): warning C4244: “初始化”: 从“__int64”转换到“int”，可能丢失数据
+D:\202607代码\sniffer\sniffer\main.c(362,31): warning C4244: “初始化”: 从“__int64”转换到“int”，可能丢失数据
   sniffer.vcxproj -> D:\202607代码\sniffer\x64\Debug\sniffer.exe

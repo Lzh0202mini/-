@@ -15,6 +15,7 @@
 // ===================== 配置宏 =====================
 #define IP_HASH_SIZE 256
 #define TOP_IP_PAIR 10
+#define DEFAULT_FILTER "ip or ip6 and (tcp or udp or icmp or icmp6)"
 
 // ===================== 全局流量统计结构体 =====================
 typedef struct {
@@ -110,7 +111,7 @@ typedef struct icmp_header
     } un;
 } icmp_header;
 
-// ========== 新增：ICMPv6头部结构体 ==========
+// ========== ICMPv6头部结构体 ==========
 typedef struct icmpv6_header
 {
     u_char icmp6_type;
@@ -235,7 +236,7 @@ void print_icmp_type(u_char type, u_char code)
     }
 }
 
-// ========== 新增：ICMPv6类型打印 ==========
+// ========== ICMPv6类型打印 ==========
 void print_icmpv6_type(u_char type, u_char code)
 {
     switch (type)
@@ -331,49 +332,86 @@ static int compare_ip_pair(const void* a, const void* b)
     return 0;
 }
 
-// ===================== HTTP解析工具 =====================
+// ===================== 增强版HTTP协议解析工具 =====================
 void parse_http_payload(const u_char* payload, int pay_len)
 {
     if (pay_len <= 0) return;
-    char buf[1024] = { 0 };
-    int copy_len = pay_len > 1023 ? 1023 : pay_len;
+    char buf[2048] = { 0 };
+    int copy_len = pay_len > 2047 ? 2047 : pay_len;
     memcpy(buf, payload, copy_len);
     buf[copy_len] = '\0';
 
-    printf("【HTTP载荷】\n");
-    if (strstr(buf, "GET ") != NULL)
-    {
-        char* p = strstr(buf, "GET ") + 4;
-        char* end = strstr(p, " HTTP");
-        if (end != NULL)
-        {
-            int url_len = end - p;
-            char url[512] = { 0 };
-            strncpy(url, p, url_len);
-            printf("请求方法: GET | URL: %s\n", url);
-        }
+    printf("【HTTP协议解析】\n");
+
+    char* line = buf;
+    char* next_line = NULL;
+
+    // 解析起始行
+    next_line = strstr(line, "\r\n");
+    if (next_line == NULL) {
+        printf("非完整HTTP报文，载荷预览:\n%.256s\n", buf);
+        return;
     }
-    else if (strstr(buf, "POST ") != NULL)
-    {
-        char* p = strstr(buf, "POST ") + 5;
-        char* end = strstr(p, " HTTP");
-        if (end != NULL)
-        {
-            int url_len = end - p;
-            char url[512] = { 0 };
-            strncpy(url, p, url_len);
-            printf("请求方法: POST | URL: %s\n", url);
-        }
+    *next_line = '\0';
+    next_line += 2;
+
+    // 判断请求/响应
+    if (strncmp(line, "GET ", 4) == 0 || strncmp(line, "POST ", 5) == 0) {
+        char method[16] = { 0 };
+        char url[512] = { 0 };
+        char version[32] = { 0 };
+        sscanf(line, "%s %s %s", method, url, version);
+        printf("请求方法: %s | 请求URL: %s | HTTP版本: %s\n", method, url, version);
     }
-    else if (strstr(buf, "HTTP/1.1 ") != NULL)
-    {
-        char* p = strstr(buf, "HTTP/1.1 ") + 9;
-        if (p[0] >= '0' && p[0] <= '9')
-        {
-            printf("响应状态码: %c%c%c\n", p[0], p[1], p[2]);
-        }
+    else if (strncmp(line, "HTTP/", 5) == 0) {
+        char version[32] = { 0 };
+        int status_code = 0;
+        char reason[128] = { 0 };
+        sscanf(line, "%s %d %s", version, &status_code, reason);
+        printf("HTTP版本: %s | 状态码: %d | 原因短语: %s\n", version, status_code, reason);
     }
-    printf("载荷预览:\n%.256s\n", buf);
+    else {
+        printf("无法识别的HTTP起始行: %s\n", line);
+    }
+
+    // 逐行解析标准头部字段
+    printf("标准头部字段:\n");
+    while (next_line != NULL && *next_line != '\r' && *next_line != '\n') {
+        char* header_end = strstr(next_line, "\r\n");
+        if (header_end == NULL) break;
+        *header_end = '\0';
+
+        char* colon = strchr(next_line, ':');
+        if (colon != NULL) {
+            *colon = '\0';
+            char* value = colon + 1;
+            while (*value == ' ') value++;
+
+            // 匹配常见头部，不区分大小写
+            if (_stricmp(next_line, "Host") == 0) {
+                printf("  Host: %s\n", value);
+            }
+            else if (_stricmp(next_line, "Content-Type") == 0) {
+                printf("  Content-Type: %s\n", value);
+            }
+            else if (_stricmp(next_line, "Content-Length") == 0) {
+                printf("  Content-Length: %s\n", value);
+            }
+            else if (_stricmp(next_line, "User-Agent") == 0) {
+                printf("  User-Agent: %.128s\n", value);
+            }
+        }
+
+        next_line = header_end + 2;
+        if (next_line >= buf + copy_len) break;
+    }
+
+    // 实体载荷预览
+    int header_size = next_line - buf;
+    int body_len = copy_len - header_size;
+    if (body_len > 0) {
+        printf("\n载荷预览(%d字节):\n%.256s\n", body_len, next_line);
+    }
 }
 
 // ===================== 流量统计打印（含TOP IP对排名） =====================
@@ -402,7 +440,7 @@ void print_traffic_stat()
     printf("ICMPv6报文：%llu 个\n", g_stat.icmpv6_cnt);
     printf("其他IP报文：%llu 个\n", other_pkt);
 
-    // ========== 新增：TOP IP对流量排名 ==========
+    // TOP IP对流量排名
     ip_pair_node** all = NULL;
     int count = 0;
     int capacity = 128;
@@ -502,7 +540,7 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
         struct ip_header* ip = (struct ip_header*)net_layer;
         net_header_len = (ip->ip_verlen & 0x0f) * 4;
 
-        // 新增：计入IP对统计
+        // 计入IP对统计
         add_ip_pair(4, (u_char*)&ip->ip_src, (u_char*)&ip->ip_dst, hdr->len);
 
         printf("【IPv4报文】\n");
@@ -537,7 +575,7 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
         struct ipv6_header* ipv6 = (struct ipv6_header*)net_layer;
         net_header_len = sizeof(ipv6_header);
 
-        // 新增：计入IP对统计
+        // 计入IP对统计
         add_ip_pair(6, ipv6->src_addr, ipv6->dst_addr, hdr->len);
 
         u_int flow_label = ntohl(ipv6->vtf) & 0x000FFFFF;
@@ -591,7 +629,8 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
         if (tcp->th_flags & 0x04) printf("RST ");
         printf("\n");
 
-        if ((sport == 80 || sport == 8080 || dport == 80 || dport == 8080) && tcp_data_len > 0)
+        // 扩展支持80/8080/8090等常见Web端口
+        if ((sport == 80 || sport == 8080 || sport == 8090 || dport == 80 || dport == 8080 || dport == 8090) && tcp_data_len > 0)
         {
             parse_http_payload(tcp_payload, tcp_data_len);
         }
@@ -675,7 +714,7 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
                 ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.seq));
         }
     }
-    // ========== 新增：ICMPv6详细解析 ==========
+    // ICMPv6详细解析
     else if (proto_flag == 58)
     {
         struct icmpv6_header* icmp6 = (struct icmpv6_header*)trans_pkt;
@@ -694,13 +733,12 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     print_traffic_stat();
 }
 
-// ===================== 离线PCAP解析入口 =====================
-int offline_parse(const char* pcap_file)
+// ===================== 离线PCAP解析入口（支持自定义过滤规则） =====================
+int offline_parse(const char* pcap_file, const char* filter_rule)
 {
     pcap_t* handle;
     char errbuf[PCAP_ERRBUF_SIZE];
     struct bpf_program fp;
-    const char* filter_rule = "ip or ip6 and (tcp or udp or icmp or icmp6)";
 
     handle = pcap_open_offline(pcap_file, errbuf);
     if (handle == NULL)
@@ -713,20 +751,50 @@ int offline_parse(const char* pcap_file)
 
     if (pcap_compile(handle, &fp, filter_rule, 0, PCAP_NETMASK_UNKNOWN) == -1)
     {
-        printf("离线BPF编译失败：%s\n", pcap_geterr(handle));
+        printf("离线BPF过滤规则编译失败：%s\n", pcap_geterr(handle));
+        printf("请检查过滤表达式语法是否正确\n");
         pcap_close(handle);
         return -1;
     }
     pcap_setfilter(handle, &fp);
     pcap_freecode(&fp);
 
-    printf("\n==================== 开始离线解析：%s ====================\n\n", pcap_file);
+    printf("\n==================== 开始离线解析 ====================\n");
+    printf("解析文件：%s\n", pcap_file);
+    printf("BPF过滤规则：%s\n\n", filter_rule);
     g_stat.last_print_time = time(NULL);
     pcap_loop(handle, 0, packet_handler, NULL);
 
     pcap_close(handle);
     printf("\n==================== 离线解析完成 ====================\n");
     return 0;
+}
+
+// ===================== 辅助：清空输入缓冲区 =====================
+void clear_stdin()
+{
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+}
+
+// ===================== 辅助：读取用户输入的过滤规则 =====================
+void input_filter_rule(char* out_buf, int buf_len)
+{
+    printf("\n请输入BPF过滤规则（直接回车使用默认规则）：\n");
+    printf("默认规则：%s\n", DEFAULT_FILTER);
+    printf("示例：tcp port 80 and host 192.168.1.1\n");
+
+    fgets(out_buf, buf_len, stdin);
+    // 去掉末尾换行符
+    size_t len = strlen(out_buf);
+    if (len > 0 && out_buf[len - 1] == '\n') {
+        out_buf[len - 1] = '\0';
+    }
+    // 用户直接回车则使用默认
+    if (strlen(out_buf) == 0) {
+        strcpy(out_buf, DEFAULT_FILTER);
+        printf("已使用默认过滤规则\n");
+    }
 }
 
 // ===================== 主函数 =====================
@@ -737,7 +805,7 @@ int main()
     char errbuf[PCAP_ERRBUF_SIZE];
     int i = 0, sel, menu_opt;
     struct bpf_program fp;
-    const char* filter_rule = "ip or ip6 and (tcp or udp or icmp or icmp6)";
+    char filter_rule[256] = DEFAULT_FILTER;
     char pcap_path[256];
 
     g_log_file = fopen("traffic_log.txt", "a+");
@@ -756,23 +824,29 @@ int main()
         printf("【提示】流量统计日志将自动保存至 traffic_log.txt\n");
     }
 
-    printf("==== 网络数据包捕获解析工具（IP对统计+ICMPv6+DNS+HTTP+离线回放）====\n");
+    printf("==== 网络数据包捕获解析工具（自定义BPF+HTTP全解析+IP对统计+ICMPv6+离线回放）====\n");
     printf("1. 实时网卡抓包\n");
     printf("2. 读取本地PCAP文件离线解析\n");
     printf("请输入功能选项(1/2)：");
     scanf("%d", &menu_opt);
+    clear_stdin();
 
     if (menu_opt == 2)
     {
         printf("请输入pcap文件路径(如 capture.pcap)：");
         scanf("%s", pcap_path);
-        offline_parse(pcap_path);
+        clear_stdin();
+
+        // 离线模式也支持自定义过滤规则
+        input_filter_rule(filter_rule, sizeof(filter_rule));
+
+        offline_parse(pcap_path, filter_rule);
         goto resource_free;
     }
 
     printf("\n==== 实时抓包模式 ====\n");
-    printf("支持：以太网、IPv4/IPv6、TCP/UDP/ICMP、DNS、HTTP(80/8080)\n");
-    printf("新增：IP对流量TOP排名、ICMPv6详细类型解析\n");
+    printf("支持：以太网、IPv4/IPv6、TCP/UDP/ICMP、DNS、HTTP(80/8080/8090)\n");
+    printf("功能：自定义BPF过滤、IP对流量TOP排名、ICMPv6详细解析、完整HTTP头部解析\n");
     printf("停止方式：Ctrl + C\n\n");
 
     if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, errbuf) == -1)
@@ -788,6 +862,8 @@ int main()
 
     printf("\n请输入网卡序号：");
     scanf("%d", &sel);
+    clear_stdin();
+
     d = alldevs;
     for (i = 1; i < sel; i++) d = d->next;
 
@@ -828,16 +904,25 @@ int main()
         printf("【提示】实时抓包自动保存至 capture.pcap\n");
     }
 
+    // 实时模式下读取用户自定义过滤规则
+    input_filter_rule(filter_rule, sizeof(filter_rule));
+
     if (pcap_compile(handle, &fp, filter_rule, 0, PCAP_NETMASK_UNKNOWN) == -1)
     {
-        printf("BPF过滤编译失败：%s\n", pcap_geterr(handle));
-        pcap_close(handle);
-        if (g_log_file != NULL) fclose(g_log_file);
-        return -1;
+        printf("BPF过滤规则编译失败：%s\n", pcap_geterr(handle));
+        printf("请检查过滤表达式语法，程序将使用默认规则重试\n");
+        strcpy(filter_rule, DEFAULT_FILTER);
+        if (pcap_compile(handle, &fp, filter_rule, 0, PCAP_NETMASK_UNKNOWN) == -1) {
+            printf("默认规则编译失败，程序退出\n");
+            pcap_close(handle);
+            if (g_log_file != NULL) fclose(g_log_file);
+            return -1;
+        }
     }
     pcap_setfilter(handle, &fp);
     pcap_freecode(&fp);
 
+    printf("\n当前生效过滤规则：%s\n", filter_rule);
     printf("\n==================== 开始实时抓包 ====================\n\n");
     g_stat.last_print_time = time(NULL);
     pcap_loop(handle, 0, packet_handler, NULL);
