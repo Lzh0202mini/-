@@ -23,6 +23,7 @@ TrafficStat g_stat = { 0, 0, 0, 0, 0, 0 };
 int g_link_type = 0;
 int g_ip_offset = 14;
 pcap_dumper_t* g_dump = NULL;  // PCAP存储句柄
+FILE* g_log_file = NULL;       // 流量日志文件句柄（新增）
 
 // ===================== 协议头部结构体 =====================
 // 以太网头部 14字节
@@ -116,7 +117,7 @@ void print_icmp_type(u_char type, u_char code)
     }
 }
 
-// ===================== 增强版流量统计打印函数（核心完善功能） =====================
+// ===================== 增强版流量统计打印 + 写入TXT日志 =====================
 void print_traffic_stat()
 {
     time_t now = time(NULL);
@@ -129,7 +130,14 @@ void print_traffic_stat()
     double total_mb = (double)g_stat.total_bytes / 1024 / 1024;
     unsigned long long other_pkt = g_stat.total_pkts - g_stat.tcp_cnt - g_stat.udp_cnt - g_stat.icmp_cnt;
 
+    // 获取本地时间字符串
+    char time_buf[64];
+    struct tm* tm_now = localtime(&now);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_now);
+
+    // 控制台输出统计面板
     printf("\n==================== 实时流量统计面板 ====================\n");
+    printf("统计时间：%s\n", time_buf);
     printf("总捕获数据包：%llu 个\n", g_stat.total_pkts);
     printf("总捕获流量：%llu 字节 (%.2f MB)\n", g_stat.total_bytes, total_mb);
     printf("----------------------------------------------------------\n");
@@ -138,6 +146,17 @@ void print_traffic_stat()
     printf("ICMP报文数量：%llu 个\n", g_stat.icmp_cnt);
     printf("其他IP报文：%llu 个\n", other_pkt);
     printf("==========================================================\n\n");
+
+    // 同步写入traffic_log.txt日志文件（新增导出功能）
+    if (g_log_file != NULL)
+    {
+        fprintf(g_log_file, "[%s] 流量统计记录\n", time_buf);
+        fprintf(g_log_file, "总数据包：%llu | 总字节：%llu | 总MB：%.2f\n", g_stat.total_pkts, g_stat.total_bytes, total_mb);
+        fprintf(g_log_file, "TCP：%llu | UDP：%llu | ICMP：%llu | 其他：%llu\n",
+            g_stat.tcp_cnt, g_stat.udp_cnt, g_stat.icmp_cnt, other_pkt);
+        fprintf(g_log_file, "--------------------------------------------------------\n");
+        fflush(g_log_file); // 立刻写入硬盘，防止缓存丢失
+    }
 }
 
 // ===================== 数据包回调函数 =====================
@@ -266,16 +285,35 @@ int main()
     int i = 0, sel;
     struct bpf_program fp;
     const char* filter_rule = "ip and (tcp or udp or icmp)";
-    printf("==== C语言数据包捕获解析工具（完善流量统计版）====\n");
-    printf("功能：抓包解析 + 增强实时流量统计 + PCAP自动保存 capture.pcap\n");
+
+    // 打开流量日志文件，追加写入模式（新增日志初始化）
+    g_log_file = fopen("traffic_log.txt", "a+");
+    if (g_log_file == NULL)
+    {
+        printf("警告：无法创建流量日志文件 traffic_log.txt\n");
+    }
+    else
+    {
+        time_t now = time(NULL);
+        char time_buf[64];
+        struct tm* tm_now = localtime(&now);
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_now);
+        fprintf(g_log_file, "==================== 抓包会话启动 [%s] ====================\n", time_buf);
+        fflush(g_log_file);
+        printf("【提示】流量统计日志将自动保存至 traffic_log.txt\n");
+    }
+
+    printf("==== C语言数据包捕获解析工具（流量日志导出完整版）====\n");
+    printf("功能：抓包解析 + 增强实时流量统计 + PCAP自动保存 + TXT流量日志导出\n");
     printf("支持：以太网、IPv4、TCP、UDP、ICMP完整解析\n");
-    printf("流量统计：总报文、总流量MB、各协议报文计数\n");
+    printf("流量统计：总报文、总流量MB、各协议报文计数，每秒写入日志\n");
     printf("停止方式：Ctrl + C\n\n");
 
     // 1. 枚举网卡
     if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, errbuf) == -1)
     {
         printf("网卡枚举失败：%s\n", errbuf);
+        if (g_log_file != NULL) fclose(g_log_file);
         return -1;
     }
     for (d = alldevs; d; d = d->next)
@@ -296,6 +334,7 @@ int main()
     {
         printf("打开网卡失败：%s\n", errbuf);
         pcap_freealldevs(alldevs);
+        if (g_log_file != NULL) fclose(g_log_file);
         return -1;
     }
     pcap_freealldevs(alldevs);
@@ -334,6 +373,7 @@ int main()
     {
         printf("BPF过滤编译失败：%s\n", pcap_geterr(handle));
         pcap_close(handle);
+        if (g_log_file != NULL) fclose(g_log_file);
         return -1;
     }
     pcap_setfilter(handle, &fp);
@@ -352,6 +392,26 @@ int main()
         pcap_dump_close(g_dump);
         printf("\n【提示】PCAP文件已完整写入 capture.pcap\n");
     }
+
+    // 程序结束写入汇总日志并关闭txt文件
+    if (g_log_file != NULL)
+    {
+        time_t now = time(NULL);
+        char time_buf[64];
+        struct tm* tm_now = localtime(&now);
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_now);
+        double total_mb = (double)g_stat.total_bytes / 1024 / 1024;
+        unsigned long long other_pkt = g_stat.total_pkts - g_stat.tcp_cnt - g_stat.udp_cnt - g_stat.icmp_cnt;
+
+        fprintf(g_log_file, "\n==================== 抓包会话结束 [%s] 汇总 ====================\n", time_buf);
+        fprintf(g_log_file, "总捕获数据包：%llu 个 | 总流量：%llu 字节 (%.2f MB)\n", g_stat.total_pkts, g_stat.total_bytes, total_mb);
+        fprintf(g_log_file, "TCP：%llu | UDP：%llu | ICMP：%llu | 其他：%llu\n",
+            g_stat.tcp_cnt, g_stat.udp_cnt, g_stat.icmp_cnt, other_pkt);
+        fprintf(g_log_file, "================================================================\n\n");
+        fclose(g_log_file);
+        printf("【提示】流量日志文件 traffic_log.txt 已关闭保存\n");
+    }
+
     pcap_close(handle);
     printf("程序正常退出\n");
     return 0;
