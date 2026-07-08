@@ -7,9 +7,14 @@
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
+#include <stdlib.h>
 #pragma comment(lib, "wpcap.lib")
 #pragma comment(lib, "Packet.lib")
 #pragma comment(lib, "ws2_32.lib")
+
+// ===================== 配置宏 =====================
+#define IP_HASH_SIZE 256
+#define TOP_IP_PAIR 10
 
 // ===================== 全局流量统计结构体 =====================
 typedef struct {
@@ -26,6 +31,17 @@ int g_link_type = 0;
 int g_ip_offset = 14;
 pcap_dumper_t* g_dump = NULL;
 FILE* g_log_file = NULL;
+
+// ===================== IP对流量统计哈希表 =====================
+typedef struct ip_pair_node {
+    int ip_version;
+    u_char src_ip[16];
+    u_char dst_ip[16];
+    unsigned long long pkt_cnt;
+    unsigned long long byte_cnt;
+    struct ip_pair_node* next;
+} ip_pair_node;
+ip_pair_node* g_ip_hash[IP_HASH_SIZE] = { NULL };
 
 // ===================== 协议头部结构体 =====================
 typedef struct ether_header
@@ -94,6 +110,21 @@ typedef struct icmp_header
     } un;
 } icmp_header;
 
+// ========== 新增：ICMPv6头部结构体 ==========
+typedef struct icmpv6_header
+{
+    u_char icmp6_type;
+    u_char icmp6_code;
+    u_short icmp6_cksum;
+    union {
+        struct {
+            u_short id;
+            u_short seq;
+        } echo;
+        u_int reserved;
+    } un;
+} icmpv6_header;
+
 // ========== DNS 相关结构体 ==========
 typedef struct dns_header {
     u_short id;
@@ -125,6 +156,15 @@ void print_mac(u_char* mac)
 void print_ipv6(u_char* addr)
 {
     printf("%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+        addr[0], addr[1], addr[2], addr[3],
+        addr[4], addr[5], addr[6], addr[7],
+        addr[8], addr[9], addr[10], addr[11],
+        addr[12], addr[13], addr[14], addr[15]);
+}
+
+void ipv6_to_str(const u_char* addr, char* out, int out_len)
+{
+    snprintf(out, out_len, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
         addr[0], addr[1], addr[2], addr[3],
         addr[4], addr[5], addr[6], addr[7],
         addr[8], addr[9], addr[10], addr[11],
@@ -173,7 +213,6 @@ void print_dns_type(u_short type)
     }
 }
 
-// 函数定义：接收 type + code 两个参数
 void print_icmp_type(u_char type, u_char code)
 {
     switch (type)
@@ -196,6 +235,38 @@ void print_icmp_type(u_char type, u_char code)
     }
 }
 
+// ========== 新增：ICMPv6类型打印 ==========
+void print_icmpv6_type(u_char type, u_char code)
+{
+    switch (type)
+    {
+    case 1:
+        printf("目的不可达, Code:%d", code);
+        break;
+    case 2:
+        printf("数据包过大(Packet Too Big)");
+        break;
+    case 3:
+        printf("超时(Time Exceeded), Code:%d", code);
+        break;
+    case 128:
+        printf("回显请求(Echo Request)");
+        break;
+    case 129:
+        printf("回显应答(Echo Reply)");
+        break;
+    case 135:
+        printf("邻居请求(Neighbor Solicitation)");
+        break;
+    case 136:
+        printf("邻居公告(Neighbor Advertisement)");
+        break;
+    default:
+        printf("未知类型:%d Code:%d", type, code);
+        break;
+    }
+}
+
 void print_ipv6_proto(u_char proto)
 {
     switch (proto)
@@ -205,6 +276,59 @@ void print_ipv6_proto(u_char proto)
     case 58: printf("ICMPv6"); break;
     default: printf("其他(%d)", proto); break;
     }
+}
+
+// ===================== IP对哈希统计工具函数 =====================
+static unsigned int ip_hash(int version, const u_char* src, const u_char* dst)
+{
+    unsigned int hash = 0;
+    int len = (version == 4) ? 4 : 16;
+    for (int i = 0; i < len; i++) {
+        hash = (hash * 31 + src[i]) % IP_HASH_SIZE;
+        hash = (hash * 31 + dst[i]) % IP_HASH_SIZE;
+    }
+    return hash;
+}
+
+static int ip_equal(int version, const u_char* a, const u_char* b)
+{
+    int len = (version == 4) ? 4 : 16;
+    return memcmp(a, b, len) == 0;
+}
+
+void add_ip_pair(int version, const u_char* src, const u_char* dst, unsigned int bytes)
+{
+    unsigned int idx = ip_hash(version, src, dst);
+    ip_pair_node* node = g_ip_hash[idx];
+    while (node != NULL) {
+        if (node->ip_version == version &&
+            ip_equal(version, node->src_ip, src) &&
+            ip_equal(version, node->dst_ip, dst)) {
+            node->pkt_cnt++;
+            node->byte_cnt += bytes;
+            return;
+        }
+        node = node->next;
+    }
+    node = (ip_pair_node*)malloc(sizeof(ip_pair_node));
+    if (node == NULL) return;
+    node->ip_version = version;
+    int len = (version == 4) ? 4 : 16;
+    memcpy(node->src_ip, src, len);
+    memcpy(node->dst_ip, dst, len);
+    node->pkt_cnt = 1;
+    node->byte_cnt = bytes;
+    node->next = g_ip_hash[idx];
+    g_ip_hash[idx] = node;
+}
+
+static int compare_ip_pair(const void* a, const void* b)
+{
+    ip_pair_node* na = *(ip_pair_node**)a;
+    ip_pair_node* nb = *(ip_pair_node**)b;
+    if (na->byte_cnt > nb->byte_cnt) return -1;
+    if (na->byte_cnt < nb->byte_cnt) return 1;
+    return 0;
 }
 
 // ===================== HTTP解析工具 =====================
@@ -252,7 +376,7 @@ void parse_http_payload(const u_char* payload, int pay_len)
     printf("载荷预览:\n%.256s\n", buf);
 }
 
-// ===================== 流量统计打印 =====================
+// ===================== 流量统计打印（含TOP IP对排名） =====================
 void print_traffic_stat()
 {
     time_t now = time(NULL);
@@ -277,8 +401,51 @@ void print_traffic_stat()
     printf("ICMPv4报文：%llu 个\n", g_stat.icmp_cnt);
     printf("ICMPv6报文：%llu 个\n", g_stat.icmpv6_cnt);
     printf("其他IP报文：%llu 个\n", other_pkt);
+
+    // ========== 新增：TOP IP对流量排名 ==========
+    ip_pair_node** all = NULL;
+    int count = 0;
+    int capacity = 128;
+    all = (ip_pair_node**)malloc(capacity * sizeof(ip_pair_node*));
+    if (all != NULL) {
+        for (int i = 0; i < IP_HASH_SIZE; i++) {
+            ip_pair_node* node = g_ip_hash[i];
+            while (node != NULL) {
+                if (count >= capacity) {
+                    capacity *= 2;
+                    ip_pair_node** tmp = (ip_pair_node**)realloc(all, capacity * sizeof(ip_pair_node*));
+                    if (tmp == NULL) break;
+                    all = tmp;
+                }
+                all[count++] = node;
+                node = node->next;
+            }
+        }
+        qsort(all, count, sizeof(ip_pair_node*), compare_ip_pair);
+
+        printf("\n---------- TOP %d IP对流量排名 ----------\n", TOP_IP_PAIR < count ? TOP_IP_PAIR : count);
+        printf("%-5s %-30s %-30s %10s %12s\n", "排名", "源IP", "目的IP", "包数", "字节数");
+        for (int i = 0; i < TOP_IP_PAIR && i < count; i++) {
+            printf("%-5d ", i + 1);
+            if (all[i]->ip_version == 4) {
+                char src_buf[32], dst_buf[32];
+                strcpy(src_buf, inet_ntoa(*(struct in_addr*)all[i]->src_ip));
+                strcpy(dst_buf, inet_ntoa(*(struct in_addr*)all[i]->dst_ip));
+                printf("%-30s %-30s ", src_buf, dst_buf);
+            }
+            else {
+                char src_str[64], dst_str[64];
+                ipv6_to_str(all[i]->src_ip, src_str, sizeof(src_str));
+                ipv6_to_str(all[i]->dst_ip, dst_str, sizeof(dst_str));
+                printf("%-30s %-30s ", src_str, dst_str);
+            }
+            printf("%10llu %12llu\n", all[i]->pkt_cnt, all[i]->byte_cnt);
+        }
+        free(all);
+    }
     printf("==========================================================\n\n");
 
+    // 日志写入
     if (g_log_file != NULL)
     {
         fprintf(g_log_file, "[%s] 流量统计记录\n", time_buf);
@@ -335,6 +502,9 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
         struct ip_header* ip = (struct ip_header*)net_layer;
         net_header_len = (ip->ip_verlen & 0x0f) * 4;
 
+        // 新增：计入IP对统计
+        add_ip_pair(4, (u_char*)&ip->ip_src, (u_char*)&ip->ip_dst, hdr->len);
+
         printf("【IPv4报文】\n");
         printf("源IP:%s | 目的IP:%s | TTL:%d | 传输层协议:",
             inet_ntoa(ip->ip_src), inet_ntoa(ip->ip_dst), ip->ip_ttl);
@@ -366,6 +536,9 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     {
         struct ipv6_header* ipv6 = (struct ipv6_header*)net_layer;
         net_header_len = sizeof(ipv6_header);
+
+        // 新增：计入IP对统计
+        add_ip_pair(6, ipv6->src_addr, ipv6->dst_addr, hdr->len);
 
         u_int flow_label = ntohl(ipv6->vtf) & 0x000FFFFF;
         u_short payload_len = ntohs(ipv6->payload_len);
@@ -494,7 +667,6 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     {
         struct icmp_header* icmp = (struct icmp_header*)trans_pkt;
         printf("【ICMPv4头部】类型：");
-        // 修复：传入 type + code 两个参数，彻底解决 C2198 报错
         print_icmp_type(icmp->icmp_type, icmp->icmp_code);
         printf(" | 校验和:0x%04X\n", ntohs(icmp->icmp_sum));
         if (icmp->icmp_type == 0 || icmp->icmp_type == 8)
@@ -503,9 +675,19 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
                 ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.seq));
         }
     }
+    // ========== 新增：ICMPv6详细解析 ==========
     else if (proto_flag == 58)
     {
-        printf("【ICMPv6报文】暂未细分类型解析\n");
+        struct icmpv6_header* icmp6 = (struct icmpv6_header*)trans_pkt;
+        printf("【ICMPv6头部】类型：");
+        print_icmpv6_type(icmp6->icmp6_type, icmp6->icmp6_code);
+        printf(" | 校验和:0x%04X\n", ntohs(icmp6->icmp6_cksum));
+        if (icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129)
+        {
+            printf("标识ID:%d 序列号:%d\n",
+                ntohs(icmp6->un.echo.id),
+                ntohs(icmp6->un.echo.seq));
+        }
     }
 
     printf("\n");
@@ -574,11 +756,10 @@ int main()
         printf("【提示】流量统计日志将自动保存至 traffic_log.txt\n");
     }
 
-    printf("==== 网络数据包捕获解析工具（IPv6+DNS+HTTP+离线回放）====\n");
+    printf("==== 网络数据包捕获解析工具（IP对统计+ICMPv6+DNS+HTTP+离线回放）====\n");
     printf("1. 实时网卡抓包\n");
     printf("2. 读取本地PCAP文件离线解析\n");
     printf("请输入功能选项(1/2)：");
-    // 修复：使用 menu_opt 变量，无 menu 未定义错误
     scanf("%d", &menu_opt);
 
     if (menu_opt == 2)
@@ -591,6 +772,7 @@ int main()
 
     printf("\n==== 实时抓包模式 ====\n");
     printf("支持：以太网、IPv4/IPv6、TCP/UDP/ICMP、DNS、HTTP(80/8080)\n");
+    printf("新增：IP对流量TOP排名、ICMPv6详细类型解析\n");
     printf("停止方式：Ctrl + C\n\n");
 
     if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, errbuf) == -1)
