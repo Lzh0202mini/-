@@ -17,6 +17,14 @@
 #define TOP_IP_PAIR 10
 #define DEFAULT_FILTER "ip or ip6 and (tcp or udp or icmp or icmp6)"
 
+// ===================== TCP 流重组配置 =====================
+#define TCP_FLOW_HASH_SIZE 256
+#define MAX_TCP_FLOWS 1024
+#define MAX_REASSEMBLY_BUF (256 * 1024)  // 每方向最大重装缓冲 256KB
+#define HTTP_PORT_80 80
+#define HTTP_PORT_ALT1 8080
+#define HTTP_PORT_ALT2 8090
+
 // ===================== 全局流量统计结构体 =====================
 typedef struct {
     unsigned long long total_pkts;
@@ -43,6 +51,45 @@ typedef struct ip_pair_node {
     struct ip_pair_node* next;
 } ip_pair_node;
 ip_pair_node* g_ip_hash[IP_HASH_SIZE] = { NULL };
+
+// ===================== TCP 流重装结构体 =====================
+typedef struct tcp_flow {
+    // 5-tuple 流标识
+    int ip_version;
+    u_char src_ip[16];
+    u_char dst_ip[16];
+    u_short src_port;
+    u_short dst_port;
+
+    // 序列号跟踪（两个方向独立）
+    u_int cli_next_seq;     // client→server 下一个期望 seq
+    u_int srv_next_seq;     // server→client 下一个期望 seq
+    int cli_seq_init;       // client方向 seq 是否已初始化
+    int srv_seq_init;       // server方向 seq 是否已初始化
+
+    // 双向重装缓冲区
+    u_char* cli_buf;        // client→server 数据（HTTP 请求）
+    int cli_buf_len;
+    int cli_buf_cap;
+    u_char* srv_buf;        // server→client 数据（HTTP 响应）
+    int srv_buf_len;
+    int srv_buf_cap;
+
+    // HTTP 解析标记（每个方向只解析一次完整消息）
+    int cli_http_done;
+    int srv_http_done;
+
+    // 流状态
+    int closed;             // FIN/RST 已关闭
+
+    struct tcp_flow* next;
+} tcp_flow;
+
+tcp_flow* g_tcp_flow_hash[TCP_FLOW_HASH_SIZE] = { NULL };
+int g_tcp_flow_count = 0;
+
+// 前向声明
+void parse_http_payload(const u_char* payload, int pay_len);
 
 // ===================== 协议头部结构体 =====================
 typedef struct ether_header
@@ -305,15 +352,16 @@ void payload_to_printable(const u_char* payload, int len, char* out, int out_len
     out[pos] = '\0';
 }
 
-// 快速判断是否为HTTP报文开头（仅解析首包，避免中间分段乱码）
+// 快速判断是否为HTTP报文开头（匹配所有HTTP方法 + 响应行）
 static int is_http_start(const u_char* data, int len) {
-    if (len < 5) return 0;
-    if (strncmp((const char*)data, "GET ", 4) == 0) return 1;
-    if (strncmp((const char*)data, "POST ", 5) == 0) return 1;
-    if (strncmp((const char*)data, "HEAD ", 5) == 0) return 1;
-    if (strncmp((const char*)data, "PUT ", 4) == 0) return 1;
-    if (strncmp((const char*)data, "DELETE ", 7) == 0) return 1;
+    if (len < 10) return 0;
+    // HTTP 响应: "HTTP/x.y ..."
     if (strncmp((const char*)data, "HTTP/", 5) == 0) return 1;
+    // HTTP 请求: "METHOD ... HTTP/x.y" — 检查第一行是否包含 " HTTP/"
+    for (int i = 0; i < len - 6 && i < 20; i++) {
+        if (data[i] == ' ' && strncmp((const char*)data + i + 1, "HTTP/", 5) == 0)
+            return 1;
+    }
     return 0;
 }
 
@@ -383,20 +431,367 @@ void reset_all_stat()
         }
         g_ip_hash[i] = NULL;
     }
+    // 释放 TCP 流重装内存
+    for (int i = 0; i < TCP_FLOW_HASH_SIZE; i++) {
+        tcp_flow* flow = g_tcp_flow_hash[i];
+        while (flow != NULL) {
+            tcp_flow* tmp = flow;
+            flow = flow->next;
+            free(tmp->cli_buf);
+            free(tmp->srv_buf);
+            free(tmp);
+        }
+        g_tcp_flow_hash[i] = NULL;
+    }
+    g_tcp_flow_count = 0;
 }
 
-// ===================== 优化版HTTP协议解析（无乱码） =====================
+// ===================== TCP 流重装引擎 =====================
+
+// 5-tuple 哈希
+static unsigned int tcp_flow_hash(int ip_ver, const u_char* src_ip, const u_char* dst_ip,
+                                   u_short src_port, u_short dst_port)
+{
+    unsigned int h = 0;
+    int ip_len = (ip_ver == 4) ? 4 : 16;
+    for (int i = 0; i < ip_len; i++) {
+        h = (h * 31 + src_ip[i]) % TCP_FLOW_HASH_SIZE;
+        h = (h * 31 + dst_ip[i]) % TCP_FLOW_HASH_SIZE;
+    }
+    h = (h * 31 + (src_port & 0xFF)) % TCP_FLOW_HASH_SIZE;
+    h = (h * 31 + ((src_port >> 8) & 0xFF)) % TCP_FLOW_HASH_SIZE;
+    h = (h * 31 + (dst_port & 0xFF)) % TCP_FLOW_HASH_SIZE;
+    h = (h * 31 + ((dst_port >> 8) & 0xFF)) % TCP_FLOW_HASH_SIZE;
+    return h;
+}
+
+// 判断 5-tuple 是否匹配（双向：交换 src/dst 也算同一个流）
+static int tcp_flow_match(tcp_flow* flow, int ip_ver,
+                           const u_char* src_ip, const u_char* dst_ip,
+                           u_short src_port, u_short dst_port)
+{
+    if (flow->ip_version != ip_ver) return 0;
+    int ip_len = (ip_ver == 4) ? 4 : 16;
+
+    // 正向匹配: flow.src==src, flow.dst==dst
+    if (memcmp(flow->src_ip, src_ip, ip_len) == 0 &&
+        memcmp(flow->dst_ip, dst_ip, ip_len) == 0 &&
+        flow->src_port == src_port && flow->dst_port == dst_port)
+        return 1;
+
+    // 反向匹配: flow.src==dst, flow.dst==src
+    if (memcmp(flow->src_ip, dst_ip, ip_len) == 0 &&
+        memcmp(flow->dst_ip, src_ip, ip_len) == 0 &&
+        flow->src_port == dst_port && flow->dst_port == src_port)
+        return 1;
+
+    return 0;
+}
+
+// 判断某个包是否为 client→server 方向
+static int tcp_is_client_dir(tcp_flow* flow, const u_char* src_ip, u_short src_port)
+{
+    int ip_len = (flow->ip_version == 4) ? 4 : 16;
+    return (memcmp(flow->src_ip, src_ip, ip_len) == 0 &&
+            flow->src_port == src_port);
+}
+
+// 查找或创建 TCP 流
+static tcp_flow* tcp_flow_lookup(int ip_ver, const u_char* src_ip, const u_char* dst_ip,
+                                  u_short src_port, u_short dst_port)
+{
+    unsigned int idx = tcp_flow_hash(ip_ver, src_ip, dst_ip, src_port, dst_port);
+    tcp_flow* flow = g_tcp_flow_hash[idx];
+
+    // 查找已有流
+    while (flow != NULL) {
+        if (tcp_flow_match(flow, ip_ver, src_ip, dst_ip, src_port, dst_port))
+            return flow;
+        flow = flow->next;
+    }
+
+    // 流数量限制
+    if (g_tcp_flow_count >= MAX_TCP_FLOWS) {
+        // 尝试清理已关闭的流
+        for (int i = 0; i < TCP_FLOW_HASH_SIZE; i++) {
+            tcp_flow* prev = NULL;
+            tcp_flow* f = g_tcp_flow_hash[i];
+            while (f != NULL) {
+                if (f->closed) {
+                    if (prev) prev->next = f->next;
+                    else g_tcp_flow_hash[i] = f->next;
+                    tcp_flow* tmp = f;
+                    f = f->next;
+                    free(tmp->cli_buf);
+                    free(tmp->srv_buf);
+                    free(tmp);
+                    g_tcp_flow_count--;
+                    continue;
+                }
+                prev = f;
+                f = f->next;
+            }
+        }
+        // 仍超限则拒绝创建
+        if (g_tcp_flow_count >= MAX_TCP_FLOWS) return NULL;
+    }
+
+    // 创建新流（第一个包的 src 视为 client 端）
+    flow = (tcp_flow*)calloc(1, sizeof(tcp_flow));
+    if (flow == NULL) return NULL;
+
+    flow->ip_version = ip_ver;
+    int ip_len = (ip_ver == 4) ? 4 : 16;
+    memcpy(flow->src_ip, src_ip, ip_len);
+    memcpy(flow->dst_ip, dst_ip, ip_len);
+    flow->src_port = src_port;
+    flow->dst_port = dst_port;
+    flow->cli_seq_init = 0;
+    flow->srv_seq_init = 0;
+    flow->cli_http_done = 0;
+    flow->srv_http_done = 0;
+    flow->closed = 0;
+
+    flow->next = g_tcp_flow_hash[idx];
+    g_tcp_flow_hash[idx] = flow;
+    g_tcp_flow_count++;
+
+    return flow;
+}
+
+// 将 payload 追加到缓冲区（按序追加；seq 跳跃则丢弃旧数据重新开始）
+static void tcp_buf_append(u_char** buf, int* buf_len, int* buf_cap,
+                            u_int* next_seq, int* seq_init,
+                            u_int pkt_seq, const u_char* data, int data_len)
+{
+    if (data_len <= 0) return;
+
+    // 首次初始化
+    if (!(*seq_init)) {
+        *next_seq = pkt_seq + data_len;
+        *seq_init = 1;
+    }
+    else {
+        // 严格按序：期望 seq == 包 seq
+        if (pkt_seq != *next_seq) {
+            // seq 跳跃：丢弃旧缓冲，重新开始
+            *buf_len = 0;
+            *next_seq = pkt_seq + data_len;
+        }
+        else {
+            *next_seq = pkt_seq + data_len;
+        }
+    }
+
+    // 确保缓冲容量
+    int need = *buf_len + data_len;
+    if (*buf_cap == 0) {
+        *buf_cap = need > 4096 ? need : 4096;
+        *buf = (u_char*)malloc(*buf_cap);
+    }
+    else if (need > *buf_cap) {
+        int new_cap = *buf_cap * 2;
+        if (new_cap < need) new_cap = need;
+        if (new_cap > MAX_REASSEMBLY_BUF) {
+            // 超出上限，丢弃旧数据重新开始
+            *buf_len = 0;
+            need = data_len;
+            new_cap = need > 4096 ? need : 4096;
+            *next_seq = pkt_seq + data_len;
+        }
+        u_char* tmp = (u_char*)realloc(*buf, new_cap);
+        if (tmp == NULL) {
+            *buf_len = 0;
+            return;
+        }
+        *buf = tmp;
+        *buf_cap = new_cap;
+    }
+
+    if (*buf == NULL) return;
+    memcpy(*buf + *buf_len, data, data_len);
+    *buf_len = need;
+}
+
+// 从 HTTP 头中提取 Content-Length 值，返回 -1 表示未找到
+static int http_parse_content_length(const u_char* data, int len)
+{
+    // 查找 \r\n\r\n 标记头部结束
+    const char* header_end = NULL;
+    for (int i = 0; i < len - 3; i++) {
+        if (data[i] == '\r' && data[i+1] == '\n' &&
+            data[i+2] == '\r' && data[i+3] == '\n') {
+            header_end = (const char*)(data + i + 4);
+            break;
+        }
+    }
+    if (header_end == NULL) return -1;
+
+    int header_len = (int)(header_end - (const char*)data);
+
+    // 不区分大小写查找 Content-Length
+    char hdr_buf[4096];
+    int copy_len = header_len < 4095 ? header_len : 4095;
+    memcpy(hdr_buf, data, copy_len);
+    hdr_buf[copy_len] = '\0';
+
+    // 逐行扫描
+    char* line = hdr_buf;
+    while (line != NULL && *line != '\0') {
+        char* nl = strstr(line, "\r\n");
+        if (nl == NULL) break;
+        *nl = '\0';
+
+        if (_strnicmp(line, "Content-Length:", 15) == 0) {
+            char* val = line + 15;
+            while (*val == ' ' || *val == '\t') val++;
+            return atoi(val);
+        }
+
+        line = nl + 2;
+    }
+
+    return -1;
+}
+
+// 尝试从重装缓冲区中提取完整 HTTP 消息并解析
+static void tcp_try_parse_http(u_char** buf, int* buf_len,
+                                int* http_done, const char* dir_label,
+                                int force)
+{
+    if (*http_done || *buf_len < 10) return;
+
+    // 查找 \r\n\r\n 标记头部结束
+    int header_end_pos = -1;
+    for (int i = 0; i < *buf_len - 3; i++) {
+        if ((*buf)[i] == '\r' && (*buf)[i+1] == '\n' &&
+            (*buf)[i+2] == '\r' && (*buf)[i+3] == '\n') {
+            header_end_pos = i;
+            break;
+        }
+    }
+    if (header_end_pos < 0) return;  // 头部尚未完整
+
+    int header_len = header_end_pos + 4;  // 包含末尾 \r\n\r\n
+    int body_len = 0;
+    int content_len = http_parse_content_length(*buf, *buf_len);
+
+    if (content_len >= 0) {
+        body_len = content_len;
+    }
+    else {
+        // 无 Content-Length：仅解析头部（如 204 No Content）
+        body_len = 0;
+    }
+
+    int total_needed = header_len + body_len;
+    if (*buf_len < total_needed) {
+        // force 模式：连接已关闭(FIN)，用实际可用数据解析
+        if (force) {
+            total_needed = *buf_len;  // 有多少解析多少
+        }
+        else {
+            return;  // body 尚未完整，继续等待
+        }
+    }
+
+    // 完整消息已就绪！调用 HTTP 解析
+    parse_http_payload(*buf, total_needed);
+
+    // 标记已解析，从缓冲区移除已消费数据
+    int remaining = *buf_len - total_needed;
+    if (remaining > 0) {
+        memmove(*buf, *buf + total_needed, remaining);
+        *buf_len = remaining;
+    }
+    else {
+        *buf_len = 0;
+    }
+    *http_done = 1;
+}
+
+// 标记流关闭（收到 FIN 或 RST）
+static void tcp_flow_mark_closed(int ip_ver, const u_char* src_ip, const u_char* dst_ip,
+                                  u_short src_port, u_short dst_port)
+{
+    unsigned int idx = tcp_flow_hash(ip_ver, src_ip, dst_ip, src_port, dst_port);
+    tcp_flow* flow = g_tcp_flow_hash[idx];
+    while (flow != NULL) {
+        if (tcp_flow_match(flow, ip_ver, src_ip, dst_ip, src_port, dst_port)) {
+            // 关闭前最后尝试解析（force=1：有多少解析多少）
+            if (!flow->cli_http_done) {
+                tcp_try_parse_http(&flow->cli_buf, &flow->cli_buf_len,
+                                   &flow->cli_http_done, "请求", 1);
+            }
+            if (!flow->srv_http_done) {
+                tcp_try_parse_http(&flow->srv_buf, &flow->srv_buf_len,
+                                   &flow->srv_http_done, "响应", 1);
+            }
+            flow->closed = 1;
+            return;
+        }
+        flow = flow->next;
+    }
+}
+
+// 主入口：TCP 载荷重装 + HTTP 解析
+static void tcp_reassemble_and_parse(int ip_ver,
+                                      const u_char* src_ip, const u_char* dst_ip,
+                                      u_short src_port, u_short dst_port,
+                                      u_int seq, const u_char* payload, int pay_len,
+                                      u_char tcp_flags)
+{
+    if (pay_len <= 0) return;
+
+    // 检测 FIN/RST 关闭
+    if ((tcp_flags & 0x01) || (tcp_flags & 0x04)) {  // FIN or RST
+        tcp_flow_mark_closed(ip_ver, src_ip, dst_ip, src_port, dst_port);
+    }
+
+    // 查找/创建流
+    tcp_flow* flow = tcp_flow_lookup(ip_ver, src_ip, dst_ip, src_port, dst_port);
+    if (flow == NULL) return;
+
+    // 判断方向并追加到对应缓冲区
+    if (tcp_is_client_dir(flow, src_ip, src_port)) {
+        // client→server（HTTP 请求方向）
+        tcp_buf_append(&flow->cli_buf, &flow->cli_buf_len, &flow->cli_buf_cap,
+                       &flow->cli_next_seq, &flow->cli_seq_init,
+                       seq, payload, pay_len);
+        if (!flow->cli_http_done) {
+            tcp_try_parse_http(&flow->cli_buf, &flow->cli_buf_len,
+                               &flow->cli_http_done, "请求", 0);
+        }
+    }
+    else {
+        // server→client（HTTP 响应方向）
+        tcp_buf_append(&flow->srv_buf, &flow->srv_buf_len, &flow->srv_buf_cap,
+                       &flow->srv_next_seq, &flow->srv_seq_init,
+                       seq, payload, pay_len);
+        if (!flow->srv_http_done) {
+            tcp_try_parse_http(&flow->srv_buf, &flow->srv_buf_len,
+                               &flow->srv_http_done, "响应", 0);
+        }
+    }
+}
+
+// ===================== 优化版HTTP协议解析（支持完整重装消息） =====================
 void parse_http_payload(const u_char* payload, int pay_len)
 {
     if (pay_len <= 0) return;
 
-    // 严格校验：不是HTTP起始包直接返回，不输出任何内容
+    // 校验：不是HTTP起始包直接返回
     if (!is_http_start(payload, pay_len)) {
         return;
     }
 
-    char buf[2048] = { 0 };
-    int copy_len = pay_len > 2047 ? 2047 : pay_len;
+    // 动态分配缓冲区以适应完整重装消息（最大 256KB，与 MAX_REASSEMBLY_BUF 对齐）
+    int buf_size = pay_len + 1;
+    if (buf_size > MAX_REASSEMBLY_BUF + 1) buf_size = MAX_REASSEMBLY_BUF + 1;
+    char* buf = (char*)malloc(buf_size);
+    if (buf == NULL) return;
+
+    int copy_len = pay_len < (buf_size - 1) ? pay_len : (buf_size - 1);
     memcpy(buf, payload, copy_len);
     buf[copy_len] = '\0';
 
@@ -409,29 +804,28 @@ void parse_http_payload(const u_char* payload, int pay_len)
     next_line = strstr(line, "\r\n");
     if (next_line == NULL) {
         printf("HTTP起始行不完整\n");
+        free(buf);
         return;
     }
     *next_line = '\0';
     next_line += 2;
 
-    // 判断请求/响应
-    if (strncmp(line, "GET ", 4) == 0 || strncmp(line, "POST ", 5) == 0 || strncmp(line, "HEAD ", 5) == 0) {
+    // 判断请求/响应：不以 "HTTP/" 开头即为请求
+    if (strncmp(line, "HTTP/", 5) != 0) {
+        // HTTP 请求：提取方法、URL、版本
         char method[16] = { 0 };
-        char url[512] = { 0 };
+        char url[1024] = { 0 };
         char version[32] = { 0 };
-        sscanf(line, "%s %s %s", method, url, version);
+        sscanf(line, "%15s %1023s %31s", method, url, version);
         printf("请求方法: %s | 请求URL: %s | HTTP版本: %s\n", method, url, version);
     }
-    else if (strncmp(line, "HTTP/", 5) == 0) {
+    else {
+        // HTTP 响应：提取版本、状态码、原因短语
         char version[32] = { 0 };
         int status_code = 0;
         char reason[128] = { 0 };
-        sscanf(line, "%s %d %s", version, &status_code, reason);
+        sscanf(line, "%31s %d %127s", version, &status_code, reason);
         printf("HTTP版本: %s | 状态码: %d | 原因短语: %s\n", version, status_code, reason);
-    }
-    else {
-        printf("无法识别的HTTP起始行\n");
-        return;
     }
 
     // 逐行解析标准头部字段
@@ -475,6 +869,7 @@ void parse_http_payload(const u_char* payload, int pay_len)
         payload_to_printable((const u_char*)next_line, preview_len, print_buf, sizeof(print_buf));
         printf("\n载荷预览(%d字节，二进制已替换为.):\n%s\n", body_len, print_buf);
     }
+    free(buf);
 }
 
 // ===================== 流量统计打印（含TOP IP对排名） =====================
@@ -760,12 +1155,44 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
         if (tcp->th_flags & 0x08) printf("PSH ");
         printf("\n");
 
-        // 优化：仅80端口且是HTTP首包才解析，避免中间分段乱码
-        if ((sport == 80 || sport == 8080 || sport == 8090 || dport == 80 || dport == 8080 || dport == 8090)
-            && tcp_data_len > 0
-            && is_http_start(tcp_payload, tcp_data_len))
+        // TCP流重组：HTTP端口触发完整流重装解析
+        // 先处理 FIN/RST 关闭（即使无载荷也要标记流关闭）
+        if ((sport == HTTP_PORT_80 || sport == HTTP_PORT_ALT1 || sport == HTTP_PORT_ALT2 ||
+             dport == HTTP_PORT_80 || dport == HTTP_PORT_ALT1 || dport == HTTP_PORT_ALT2)
+            && ((tcp->th_flags & 0x01) || (tcp->th_flags & 0x04)))
         {
-            parse_http_payload(tcp_payload, tcp_data_len);
+            const u_char* src_ip_raw;
+            const u_char* dst_ip_raw;
+            if (ip_version == 4) {
+                src_ip_raw = net_layer + 12;
+                dst_ip_raw = net_layer + 16;
+            }
+            else {
+                src_ip_raw = net_layer + 8;
+                dst_ip_raw = net_layer + 24;
+            }
+            tcp_flow_mark_closed(ip_version, src_ip_raw, dst_ip_raw, sport, dport);
+        }
+
+        if ((sport == HTTP_PORT_80 || sport == HTTP_PORT_ALT1 || sport == HTTP_PORT_ALT2 ||
+             dport == HTTP_PORT_80 || dport == HTTP_PORT_ALT1 || dport == HTTP_PORT_ALT2)
+            && tcp_data_len > 0)
+        {
+            const u_char* src_ip_raw;
+            const u_char* dst_ip_raw;
+            if (ip_version == 4) {
+                src_ip_raw = net_layer + 12;
+                dst_ip_raw = net_layer + 16;
+            }
+            else {
+                src_ip_raw = net_layer + 8;
+                dst_ip_raw = net_layer + 24;
+            }
+            tcp_reassemble_and_parse(ip_version, src_ip_raw, dst_ip_raw,
+                                     sport, dport,
+                                     ntohl(tcp->th_seq),
+                                     tcp_payload, tcp_data_len,
+                                     tcp->th_flags);
         }
     }
     else if (proto_flag == 17)
