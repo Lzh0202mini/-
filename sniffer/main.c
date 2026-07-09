@@ -172,21 +172,26 @@ void ipv6_to_str(const u_char* addr, char* out, int out_len)
         addr[12], addr[13], addr[14], addr[15]);
 }
 
-const u_char* dns_parse_domain(const u_char* pkt, const u_char* start, char* out, int out_len)
+// 修复：增加数据包边界end参数，防止越界访问
+const u_char* dns_parse_domain(const u_char* pkt, const u_char* end, const u_char* start, char* out, int out_len)
 {
     int pos = 0;
     const u_char* ptr = start;
-    while (1)
+    while (ptr < end)
     {
         u_char len = *ptr++;
         if (len == 0)
             break;
+        // 处理域名压缩指针
         if ((len & 0xC0) == 0xC0)
         {
+            if (ptr >= end) break;
             u_short offset = ((len & 0x3F) << 8) | (*ptr++);
             ptr = pkt + offset;
             continue;
         }
+        // 长度越界检查
+        if (ptr + len > end) break;
         for (int i = 0; i < len; i++)
         {
             if (pos >= out_len - 1)
@@ -279,6 +284,39 @@ void print_ipv6_proto(u_char proto)
     }
 }
 
+// ========== 新增：HTTP乱码修复辅助函数 ==========
+// 判断是否为可打印ASCII字符
+static int is_printable(char c) {
+    return (c >= 32 && c <= 126) || c == '\r' || c == '\n' || c == '\t';
+}
+
+// 将二进制载荷转换为可打印字符串，不可见字符替换为.
+void payload_to_printable(const u_char* payload, int len, char* out, int out_len) {
+    int pos = 0;
+    for (int i = 0; i < len && pos < out_len - 1; i++) {
+        char c = (char)payload[i];
+        if (is_printable(c)) {
+            out[pos++] = c;
+        }
+        else {
+            out[pos++] = '.';
+        }
+    }
+    out[pos] = '\0';
+}
+
+// 快速判断是否为HTTP报文开头（仅解析首包，避免中间分段乱码）
+static int is_http_start(const u_char* data, int len) {
+    if (len < 5) return 0;
+    if (strncmp((const char*)data, "GET ", 4) == 0) return 1;
+    if (strncmp((const char*)data, "POST ", 5) == 0) return 1;
+    if (strncmp((const char*)data, "HEAD ", 5) == 0) return 1;
+    if (strncmp((const char*)data, "PUT ", 4) == 0) return 1;
+    if (strncmp((const char*)data, "DELETE ", 7) == 0) return 1;
+    if (strncmp((const char*)data, "HTTP/", 5) == 0) return 1;
+    return 0;
+}
+
 // ===================== IP对哈希统计工具函数 =====================
 static unsigned int ip_hash(int version, const u_char* src, const u_char* dst)
 {
@@ -332,10 +370,31 @@ static int compare_ip_pair(const void* a, const void* b)
     return 0;
 }
 
-// ===================== 增强版HTTP协议解析工具 =====================
+// 新增：重置所有统计并释放哈希表内存
+void reset_all_stat()
+{
+    memset(&g_stat, 0, sizeof(g_stat));
+    for (int i = 0; i < IP_HASH_SIZE; i++) {
+        ip_pair_node* node = g_ip_hash[i];
+        while (node != NULL) {
+            ip_pair_node* tmp = node;
+            node = node->next;
+            free(tmp);
+        }
+        g_ip_hash[i] = NULL;
+    }
+}
+
+// ===================== 优化版HTTP协议解析（无乱码） =====================
 void parse_http_payload(const u_char* payload, int pay_len)
 {
     if (pay_len <= 0) return;
+
+    // 严格校验：不是HTTP起始包直接返回，不输出任何内容
+    if (!is_http_start(payload, pay_len)) {
+        return;
+    }
+
     char buf[2048] = { 0 };
     int copy_len = pay_len > 2047 ? 2047 : pay_len;
     memcpy(buf, payload, copy_len);
@@ -349,14 +408,14 @@ void parse_http_payload(const u_char* payload, int pay_len)
     // 解析起始行
     next_line = strstr(line, "\r\n");
     if (next_line == NULL) {
-        printf("非完整HTTP报文，载荷预览:\n%.256s\n", buf);
+        printf("HTTP起始行不完整\n");
         return;
     }
     *next_line = '\0';
     next_line += 2;
 
     // 判断请求/响应
-    if (strncmp(line, "GET ", 4) == 0 || strncmp(line, "POST ", 5) == 0) {
+    if (strncmp(line, "GET ", 4) == 0 || strncmp(line, "POST ", 5) == 0 || strncmp(line, "HEAD ", 5) == 0) {
         char method[16] = { 0 };
         char url[512] = { 0 };
         char version[32] = { 0 };
@@ -371,7 +430,8 @@ void parse_http_payload(const u_char* payload, int pay_len)
         printf("HTTP版本: %s | 状态码: %d | 原因短语: %s\n", version, status_code, reason);
     }
     else {
-        printf("无法识别的HTTP起始行: %s\n", line);
+        printf("无法识别的HTTP起始行\n");
+        return;
     }
 
     // 逐行解析标准头部字段
@@ -406,11 +466,14 @@ void parse_http_payload(const u_char* payload, int pay_len)
         if (next_line >= buf + copy_len) break;
     }
 
-    // 实体载荷预览
+    // 实体载荷预览（仅可打印字符，二进制替换为.）
     int header_size = next_line - buf;
     int body_len = copy_len - header_size;
     if (body_len > 0) {
-        printf("\n载荷预览(%d字节):\n%.256s\n", body_len, next_line);
+        char print_buf[257] = { 0 };
+        int preview_len = body_len > 256 ? 256 : body_len;
+        payload_to_printable((const u_char*)next_line, preview_len, print_buf, sizeof(print_buf));
+        printf("\n载荷预览(%d字节，二进制已替换为.):\n%s\n", body_len, print_buf);
     }
 }
 
@@ -498,9 +561,21 @@ void print_traffic_stat()
 // ===================== 数据包回调函数 =====================
 void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* pkt)
 {
+    // 修复：写入pcap文件，解决原代码capture.pcap为空的问题
+    if (g_dump != NULL) {
+        pcap_dump((u_char*)g_dump, hdr, pkt);
+    }
+
     g_stat.total_pkts++;
     g_stat.total_bytes += hdr->len;
     printf("===== 数据包 总长度:%d =====\n", hdr->len);
+
+    // 修复：以太网头部长度校验，防止畸形包越界
+    if (g_link_type == DLT_EN10MB && hdr->len < 14) {
+        printf("数据包过短，不足以太网头部长度，跳过解析\n\n");
+        print_traffic_stat();
+        return;
+    }
 
     const u_char* net_layer = pkt + g_ip_offset;
     int ip_version = (net_layer[0] >> 4);
@@ -508,6 +583,7 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     int net_header_len = 0;
     int tcp_data_len = 0;
     const u_char* tcp_payload = NULL;
+    const u_char* pkt_end = pkt + hdr->len;
 
     if (g_link_type == DLT_EN10MB)
     {
@@ -531,21 +607,43 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     else if (g_link_type == DLT_NULL)
     {
         printf("【环回虚拟网卡】无以太网头部\n");
-        net_layer = pkt + 4;
-        ip_version = (net_layer[0] >> 4);
+    }
+
+    // IP头部最小长度校验
+    if ((net_layer + 1) > pkt_end) {
+        printf("IP头部过短，无法解析版本\n\n");
+        print_traffic_stat();
+        return;
     }
 
     if (ip_version == 4)
     {
+        // 修复：IPv4最小头部20字节校验
+        if (net_layer + 20 > pkt_end) {
+            printf("IPv4头部过短，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
+
         struct ip_header* ip = (struct ip_header*)net_layer;
         net_header_len = (ip->ip_verlen & 0x0f) * 4;
+        if (net_header_len < 20 || net_layer + net_header_len > pkt_end) {
+            printf("IPv4头部长度非法，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
 
         // 计入IP对统计
         add_ip_pair(4, (u_char*)&ip->ip_src, (u_char*)&ip->ip_dst, hdr->len);
 
+        // 修复：解决inet_ntoa连续调用导致IP显示相同的bug
+        char src_ip_str[32], dst_ip_str[32];
+        strcpy(src_ip_str, inet_ntoa(ip->ip_src));
+        strcpy(dst_ip_str, inet_ntoa(ip->ip_dst));
+
         printf("【IPv4报文】\n");
         printf("源IP:%s | 目的IP:%s | TTL:%d | 传输层协议:",
-            inet_ntoa(ip->ip_src), inet_ntoa(ip->ip_dst), ip->ip_ttl);
+            src_ip_str, dst_ip_str, ip->ip_ttl);
 
         if (ip->ip_proto == 6)
         {
@@ -572,6 +670,13 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     }
     else if (ip_version == 6)
     {
+        // 修复：IPv6基本头部40字节校验
+        if (net_layer + 40 > pkt_end) {
+            printf("IPv6头部过短，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
+
         struct ipv6_header* ipv6 = (struct ipv6_header*)net_layer;
         net_header_len = sizeof(ipv6_header);
 
@@ -605,20 +710,45 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     }
 
     const u_char* trans_pkt = net_layer + net_header_len;
+    if (trans_pkt >= pkt_end) {
+        printf("传输层头部越界，跳过解析\n\n");
+        print_traffic_stat();
+        return;
+    }
 
     if (proto_flag == 6)
     {
+        // TCP最小头部20字节校验
+        if (trans_pkt + 20 > pkt_end) {
+            printf("TCP头部过短，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
+
         struct tcp_header* tcp = (struct tcp_header*)trans_pkt;
         u_short sport = ntohs(tcp->th_sport);
         u_short dport = ntohs(tcp->th_dport);
         int tcp_hdr_len = (tcp->th_offx2 >> 4) * 4;
+
+        // TCP头部长度合法性校验
+        if (tcp_hdr_len < 20 || trans_pkt + tcp_hdr_len > pkt_end) {
+            printf("TCP头部长度非法，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
+
         unsigned int ip_total_len = 0;
         if (ip_version == 4)
             ip_total_len = ntohs(((ip_header*)net_layer)->ip_len);
         else
             ip_total_len = net_header_len + ntohs(((ipv6_header*)net_layer)->payload_len);
 
-        tcp_data_len = ip_total_len - net_header_len - tcp_hdr_len;
+        // 修复：TCP载荷长度非负保护
+        tcp_data_len = (int)ip_total_len - net_header_len - tcp_hdr_len;
+        if (tcp_data_len < 0) tcp_data_len = 0;
+        if (trans_pkt + tcp_hdr_len + tcp_data_len > pkt_end) {
+            tcp_data_len = (int)(pkt_end - (trans_pkt + tcp_hdr_len));
+        }
         tcp_payload = trans_pkt + tcp_hdr_len;
 
         printf("【TCP头部】源端口:%d 目的端口:%d\n", sport, dport);
@@ -627,16 +757,26 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
         if (tcp->th_flags & 0x10) printf("ACK ");
         if (tcp->th_flags & 0x01) printf("FIN ");
         if (tcp->th_flags & 0x04) printf("RST ");
+        if (tcp->th_flags & 0x08) printf("PSH ");
         printf("\n");
 
-        // 扩展支持80/8080/8090等常见Web端口
-        if ((sport == 80 || sport == 8080 || sport == 8090 || dport == 80 || dport == 8080 || dport == 8090) && tcp_data_len > 0)
+        // 优化：仅80端口且是HTTP首包才解析，避免中间分段乱码
+        if ((sport == 80 || sport == 8080 || sport == 8090 || dport == 80 || dport == 8080 || dport == 8090)
+            && tcp_data_len > 0
+            && is_http_start(tcp_payload, tcp_data_len))
         {
             parse_http_payload(tcp_payload, tcp_data_len);
         }
     }
     else if (proto_flag == 17)
     {
+        // UDP头部8字节校验
+        if (trans_pkt + 8 > pkt_end) {
+            printf("UDP头部过短，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
+
         struct udp_header* udp = (struct udp_header*)trans_pkt;
         u_short sport = ntohs(udp->uh_sport);
         u_short dport = ntohs(udp->uh_dport);
@@ -647,68 +787,86 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
         {
             printf("========== DNS报文解析 ==========\n");
             const u_char* dns_data = trans_pkt + sizeof(udp_header);
-            dns_header* dns_hdr = (dns_header*)dns_data;
-
-            u_short id = ntohs(dns_hdr->id);
-            u_short flags = ntohs(dns_hdr->flags);
-            u_short qd = ntohs(dns_hdr->qdcount);
-            u_short an = ntohs(dns_hdr->ancount);
-
-            printf("DNS事务ID: 0x%04X\n", id);
-            printf("QR:%d OPCODE:%d AA:%d TC:%d RD:%d RA:%d\n",
-                (flags >> 15) & 1, (flags >> 11) & 0xF,
-                (flags >> 10) & 1, (flags >> 9) & 1,
-                (flags >> 8) & 1, (flags >> 7) & 1);
-            printf("查询段数量: %d | 应答段数量: %d\n", qd, an);
-
-            const u_char* ptr = dns_data + sizeof(dns_header);
-            char domain_buf[256];
-            for (int i = 0; i < qd; i++)
-            {
-                ptr = dns_parse_domain(dns_data, ptr, domain_buf, sizeof(domain_buf));
-                u_short qtype = ntohs(*(u_short*)(ptr));
-                ptr += 4;
-                printf("【查询%d】域名:%s 类型:", i + 1, domain_buf);
-                print_dns_type(qtype);
-                printf("\n");
+            if (dns_data + 12 > pkt_end) {
+                printf("DNS头部过短，跳过解析\n");
             }
-            for (int i = 0; i < an; i++)
-            {
-                ptr = dns_parse_domain(dns_data, ptr, domain_buf, sizeof(domain_buf));
-                dns_rr* rr = (dns_rr*)ptr;
-                ptr += sizeof(dns_rr);
-                u_short rtype = ntohs(rr->type);
-                u_int ttl = ntohl(rr->ttl);
-                u_short rdlen = ntohs(rr->rdlength);
+            else {
+                dns_header* dns_hdr = (dns_header*)dns_data;
 
-                printf("【应答%d】域名:%s TTL:%d 类型:", i + 1, domain_buf, ttl);
-                print_dns_type(rtype);
-                printf(" 数据:");
-                if (rtype == DNS_TYPE_A && rdlen == 4)
+                u_short id = ntohs(dns_hdr->id);
+                u_short flags = ntohs(dns_hdr->flags);
+                u_short qd = ntohs(dns_hdr->qdcount);
+                u_short an = ntohs(dns_hdr->ancount);
+
+                printf("DNS事务ID: 0x%04X\n", id);
+                printf("QR:%d OPCODE:%d AA:%d TC:%d RD:%d RA:%d\n",
+                    (flags >> 15) & 1, (flags >> 11) & 0xF,
+                    (flags >> 10) & 1, (flags >> 9) & 1,
+                    (flags >> 8) & 1, (flags >> 7) & 1);
+                printf("查询段数量: %d | 应答段数量: %d\n", qd, an);
+
+                const u_char* ptr = dns_data + sizeof(dns_header);
+                char domain_buf[256];
+                // 解析查询段
+                for (int i = 0; i < qd && ptr < pkt_end; i++)
                 {
-                    printf("%d.%d.%d.%d", ptr[0], ptr[1], ptr[2], ptr[3]);
+                    ptr = dns_parse_domain(dns_data, pkt_end, ptr, domain_buf, sizeof(domain_buf));
+                    if (ptr + 4 > pkt_end) break;
+                    u_short qtype = ntohs(*(u_short*)(ptr));
+                    ptr += 4;
+                    printf("【查询%d】域名:%s 类型:", i + 1, domain_buf);
+                    print_dns_type(qtype);
+                    printf("\n");
                 }
-                else if (rtype == DNS_TYPE_AAAA && rdlen == 16)
+                // 解析应答段
+                for (int i = 0; i < an && ptr < pkt_end; i++)
                 {
-                    print_ipv6((u_char*)ptr);
+                    ptr = dns_parse_domain(dns_data, pkt_end, ptr, domain_buf, sizeof(domain_buf));
+                    if (ptr + sizeof(dns_rr) > pkt_end) break;
+                    dns_rr* rr = (dns_rr*)ptr;
+                    ptr += sizeof(dns_rr);
+                    u_short rtype = ntohs(rr->type);
+                    u_int ttl = ntohl(rr->ttl);
+                    u_short rdlen = ntohs(rr->rdlength);
+
+                    if (ptr + rdlen > pkt_end) break;
+
+                    printf("【应答%d】域名:%s TTL:%d 类型:", i + 1, domain_buf, ttl);
+                    print_dns_type(rtype);
+                    printf(" 数据:");
+                    if (rtype == DNS_TYPE_A && rdlen == 4)
+                    {
+                        printf("%d.%d.%d.%d", ptr[0], ptr[1], ptr[2], ptr[3]);
+                    }
+                    else if (rtype == DNS_TYPE_AAAA && rdlen == 16)
+                    {
+                        print_ipv6((u_char*)ptr);
+                    }
+                    else
+                    {
+                        printf("二进制数据(%d字节)", rdlen);
+                    }
+                    printf("\n");
+                    ptr += rdlen;
                 }
-                else
-                {
-                    printf("二进制数据(%d字节)", rdlen);
-                }
-                printf("\n");
-                ptr += rdlen;
             }
             printf("==================================\n");
         }
     }
     else if (proto_flag == 1)
     {
+        // ICMPv4最小头部4字节校验
+        if (trans_pkt + 4 > pkt_end) {
+            printf("ICMPv4头部过短，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
+
         struct icmp_header* icmp = (struct icmp_header*)trans_pkt;
         printf("【ICMPv4头部】类型：");
         print_icmp_type(icmp->icmp_type, icmp->icmp_code);
         printf(" | 校验和:0x%04X\n", ntohs(icmp->icmp_sum));
-        if (icmp->icmp_type == 0 || icmp->icmp_type == 8)
+        if ((icmp->icmp_type == 0 || icmp->icmp_type == 8) && trans_pkt + 8 <= pkt_end)
         {
             printf("标识ID:%d 序列号:%d\n",
                 ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.seq));
@@ -717,11 +875,18 @@ void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* p
     // ICMPv6详细解析
     else if (proto_flag == 58)
     {
+        // ICMPv6最小头部4字节校验
+        if (trans_pkt + 4 > pkt_end) {
+            printf("ICMPv6头部过短，跳过解析\n\n");
+            print_traffic_stat();
+            return;
+        }
+
         struct icmpv6_header* icmp6 = (struct icmpv6_header*)trans_pkt;
         printf("【ICMPv6头部】类型：");
         print_icmpv6_type(icmp6->icmp6_type, icmp6->icmp6_code);
         printf(" | 校验和:0x%04X\n", ntohs(icmp6->icmp6_cksum));
-        if (icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129)
+        if ((icmp6->icmp6_type == 128 || icmp6->icmp6_type == 129) && trans_pkt + 8 <= pkt_end)
         {
             printf("标识ID:%d 序列号:%d\n",
                 ntohs(icmp6->un.echo.id),
@@ -746,6 +911,10 @@ int offline_parse(const char* pcap_file, const char* filter_rule)
         printf("打开离线文件失败：%s\n", errbuf);
         return -1;
     }
+
+    // 修复：离线解析前重置统计与哈希表，避免与历史数据累加
+    reset_all_stat();
+
     g_link_type = pcap_datalink(handle);
     g_ip_offset = (g_link_type == DLT_EN10MB) ? 14 : 4;
 
@@ -852,7 +1021,9 @@ int main()
     if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, errbuf) == -1)
     {
         printf("网卡枚举失败：%s\n", errbuf);
+        printf("请确认已安装Npcap/WinPcap并以管理员身份运行程序\n");
         if (g_log_file != NULL) fclose(g_log_file);
+        reset_all_stat();
         return -1;
     }
     for (d = alldevs; d; d = d->next)
@@ -860,9 +1031,25 @@ int main()
         printf("%d. %s | %s\n", ++i, d->name, d->description ? d->description : "无描述");
     }
 
+    if (i == 0) {
+        printf("未找到可用网卡，请检查Npcap安装状态\n");
+        pcap_freealldevs(alldevs);
+        if (g_log_file != NULL) fclose(g_log_file);
+        reset_all_stat();
+        return -1;
+    }
+
     printf("\n请输入网卡序号：");
     scanf("%d", &sel);
     clear_stdin();
+
+    if (sel < 1 || sel > i) {
+        printf("输入的网卡序号无效\n");
+        pcap_freealldevs(alldevs);
+        if (g_log_file != NULL) fclose(g_log_file);
+        reset_all_stat();
+        return -1;
+    }
 
     d = alldevs;
     for (i = 1; i < sel; i++) d = d->next;
@@ -873,9 +1060,13 @@ int main()
         printf("打开网卡失败：%s\n", errbuf);
         pcap_freealldevs(alldevs);
         if (g_log_file != NULL) fclose(g_log_file);
+        reset_all_stat();
         return -1;
     }
     pcap_freealldevs(alldevs);
+
+    // 实时抓包前重置统计
+    reset_all_stat();
 
     g_link_type = pcap_datalink(handle);
     if (g_link_type == DLT_EN10MB)
@@ -898,6 +1089,7 @@ int main()
     if (g_dump == NULL)
     {
         printf("PCAP文件创建失败：%s\n", pcap_geterr(handle));
+        printf("将继续抓包，但不会保存到文件\n");
     }
     else
     {
@@ -915,7 +1107,9 @@ int main()
         if (pcap_compile(handle, &fp, filter_rule, 0, PCAP_NETMASK_UNKNOWN) == -1) {
             printf("默认规则编译失败，程序退出\n");
             pcap_close(handle);
+            if (g_dump != NULL) pcap_dump_close(g_dump);
             if (g_log_file != NULL) fclose(g_log_file);
+            reset_all_stat();
             return -1;
         }
     }
@@ -953,6 +1147,9 @@ resource_free:
         fclose(g_log_file);
         printf("【提示】流量日志 traffic_log.txt 已关闭保存\n");
     }
+
+    // 释放哈希表内存
+    reset_all_stat();
 
     printf("程序正常退出\n");
     return 0;
